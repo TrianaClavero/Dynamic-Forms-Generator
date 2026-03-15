@@ -1,27 +1,32 @@
-from time import time
-
-from fastapi import FastAPI, HTTPException, Depends
+import os
+import time
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from jsonschema import validate, ValidationError
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError
-from . import models, database
+from . import models, schemas
 from .database import engine, get_db
 
-models.Base.metadata.create_all(bind=engine)
-
-def create_tables():
-    retries = 5
+# Initialize database with retry logic
+def init_db():
+    """Initialize database with retry pattern for container startup"""
+    retries = 20
     while retries > 0:
         try:
             models.Base.metadata.create_all(bind=engine)
-            print("Tablas creadas exitosamente")
-            break
-        except OperationalError:
+            print("✅ Database tables created successfully")
+            return
+        except OperationalError as e:
             retries -= 1
-            print(f"Esperando a la DB... reintentos restantes: {retries}")
-            time.sleep(2)
+            wait_time = 2
+            print(f"⏳ Waiting for DB... retries left: {retries} - {e}")
+            time.sleep(wait_time)
+    
+    raise RuntimeError("Failed to connect to database after retries")
 
-create_tables()
+init_db()
 
 app = FastAPI(
     title="Motor de Formularios Dinámicos",
@@ -33,47 +38,98 @@ app = FastAPI(
     },
 )
 
-@app.get("/")
-def read_root():
-    return {"status": "Backend de Formularios Dinámicos Activo"}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.post("/forms/{form_id}/submit")
-def submit_form(form_id: int, data: dict, db: Session = Depends(get_db)):
-    form = db.query(models.FormDefinition).filter(models.FormDefinition.id == form_id).first()
-    if not form:
-        raise HTTPException(status_code=404, detail="Formulario no encontrado")
+@app.get("/health", tags=["Health"])
+def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
 
+@app.post("/forms/", response_model=schemas.FormResponse, tags=["Forms"], status_code=status.HTTP_201_CREATED)
+def create_form(
+    form_data: schemas.FormCreateRequest, 
+    db: Session = Depends(get_db)
+):
+    """Create a new dynamic form with JSON Schema definition"""
     try:
-        validate(instance=data, schema=form.schema_json)
-    except ValidationError as e:
-        raise HTTPException(status_code=400, detail=f"Error de validación: {e.message}")
+        new_form = models.FormDefinition(
+            title=form_data.title,
+            description=form_data.description,
+            definition=form_data.definition
+        )
+        db.add(new_form)
+        db.commit()
+        db.refresh(new_form)
+        return new_form
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create form: {str(e)}"
+        )
 
-    new_submission = models.FormSubmission(form_id=form_id, data_json=data)
-    db.add(new_submission)
-    db.commit()
-    db.refresh(new_submission)
-    
-    return {"message": "Respuesta guardada con éxito", "id": new_submission.id}
-
-@app.post("/forms/")
-def create_form(title: str, schema: dict, db: Session = Depends(database.get_db)):
-    new_form = models.FormDefinition(title=title, schema_json=schema)
-    db.add(new_form)
-    db.commit()
-    db.refresh(new_form)
-    return new_form
-
-def get_form_from_db(form_id: int):
-    db = next(database.get_db())
+@app.get("/forms/{form_id}", response_model=schemas.FormResponse, tags=["Forms"])
+def get_form(form_id: int, db: Session = Depends(get_db)):
+    """Retrieve a form definition by ID"""
     form = db.query(models.FormDefinition).filter(models.FormDefinition.id == form_id).first()
     if not form:
-        raise HTTPException(status_code=404, detail="Formulario no encontrado")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Formulario no encontrado")
     return form
 
-def save_submission(form_id: int, data: dict):
-    db = next(database.get_db())
-    submission = models.FormSubmission(form_id=form_id, data_json=data)
-    db.add(submission)
-    db.commit()
-    db.refresh(submission)
-    return submission
+@app.post("/forms/{form_id}/submit", tags=["Submissions"], status_code=status.HTTP_200_OK)
+def submit_form(
+    form_id: int,
+    submission: schemas.FormSubmissionCreate,
+    db: Session = Depends(get_db)
+):
+    """Submit form data for validation against form schema"""
+    # Verify form exists
+    form = db.query(models.FormDefinition).filter(models.FormDefinition.id == form_id).first()
+    if not form:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Formulario no encontrado")
+
+    # Validate submission against schema
+    try:
+        validate(instance=submission.data, schema=form.definition)
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Error de validación: {e.message}"
+        )
+
+    # Save submission
+    try:
+        new_submission = models.FormSubmission(form_id=form_id, data_json=submission.data)
+        db.add(new_submission)
+        db.commit()
+        db.refresh(new_submission)
+        return {
+            "id": new_submission.id,
+            "message": "Respuesta guardada con éxito",
+            "submitted_at": new_submission.submitted_at
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save submission: {str(e)}"
+        )
+
+@app.get("/forms/{form_id}/submissions", tags=["Submissions"])
+def get_submissions(form_id: int, db: Session = Depends(get_db), skip: int = 0, limit: int = 10):
+    """Retrieve all submissions for a specific form"""
+    form = db.query(models.FormDefinition).filter(models.FormDefinition.id == form_id).first()
+    if not form:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Formulario no encontrado")
+    
+    submissions = db.query(models.FormSubmission).filter(
+        models.FormSubmission.form_id == form_id
+    ).offset(skip).limit(limit).all()
+    
+    return submissions
